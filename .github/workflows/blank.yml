@@ -1,0 +1,40 @@
+name: Generate assets for Mr Fox (no secrets required)
+
+on:
+  push:
+    branches:
+      - feature/youtube-automation
+  workflow_dispatch: {}
+
+jobs:
+  generate-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate thumbnails (if IMAGE_API_KEY present)
+        run: |
+          node scripts/generate-thumbnails.js --slug validate-72h --variations 4 || echo "Thumbnail generation skipped or failed (no IMAGE_API_KEY or provider)."
+
+      - name: Prepare upload package
+        run: |
+          mkdir -p artifacts
+          cp -r videos/validate-72h artifacts/ || true
+
+      - name: Upload artifacts (thumbnails & metadata)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mr-fox-video-assets
+          path: |
+            artifacts/validate-72h
+            videos/validate-72h/metadata.json
+            videos/validate-72h/description.md
