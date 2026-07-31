@@ -1,4 +1,18 @@
-name: Generate assets for Mr Fox (no secrets required)
+#!/usr/bin/env node
+/**
+ * create_mr_fox_project.js
+ *
+ * Run: node create_mr_fox_project.js
+ *
+ * This script writes the full Mr Fox YouTube automation project files into the
+ * current directory (creates subfolders as needed). It does NOT add any secrets
+ * or run Git; it only writes files. After running, follow the printed next steps.
+ */
+const fs = require('fs');
+const path = require('path');
+
+const files = {
+  '.github/workflows/upload-video.yml': `name: Generate assets for Mr Fox (no secrets required)
 
 on:
   push:
@@ -38,3 +52,211 @@ jobs:
             artifacts/validate-72h
             videos/validate-72h/metadata.json
             videos/validate-72h/description.md
+`,
+
+  'package.json': `{
+  "name": "mr-fox-youtube-automation",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node scripts/youtube-upload.js",
+    "generate-thumbs": "node scripts/generate-thumbnails.js --slug validate-72h --variations 4"
+  },
+  "dependencies": {
+    "googleapis": "^124.0.0",
+    "node-fetch": "^2.6.7",
+    "form-data": "^4.0.0",
+    "minimist": "^1.2.8"
+  }
+}
+`,
+
+  'scripts/generate-thumbnails.js': `/*
+Generate thumbnails for a given video slug.
+- Reads prompts from videos/<slug>/thumbnail-prompts.txt (one prompt per line).
+- Writes PNGs to videos/<slug>/thumbnails/.
+- If no IMAGE_API_KEY is present in env, the script exits with message and skips generation.
+*/
+const fs = require('fs');
+const path = require('path');
+const fetch = require('node-fetch');
+const argv = require('minimist')(process.argv.slice(2));
+
+const slug = argv.slug || 'validate-72h';
+const variations = parseInt(argv.variations || '4', 10);
+const provider = (process.env.IMAGE_API_PROVIDER || 'stability').toLowerCase();
+const apiKey = process.env.IMAGE_API_KEY;
+
+const promptsPath = path.join('videos', slug, 'thumbnail-prompts.txt');
+if (!fs.existsSync(promptsPath)) {
+  console.error(\`Prompts file not found: \${promptsPath}\`);
+  process.exit(1);
+}
+const prompts = fs.readFileSync(promptsPath, 'utf8').trim().split('\\n').filter(Boolean);
+const outDir = path.join('videos', slug, 'thumbnails');
+fs.mkdirSync(outDir, { recursive: true });
+
+async function generateStability(prompt, filename) {
+  if (!apiKey) throw new Error('IMAGE_API_KEY not set');
+  const url = 'https://api.stability.ai/v1/generation/stable-diffusion-v1-5/text-to-image';
+  const body = {
+    text_prompts: [{ text: prompt }],
+    cfg_scale: 7,
+    height: 1080,
+    width: 1920,
+    samples: 1,
+    steps: 30
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': \`Bearer \${apiKey}\`
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(\`Stability API error: \${res.status} \${txt}\`);
+  }
+  const data = await res.json();
+  if (!data || !data.artifacts || !data.artifacts.length) throw new Error('Unexpected Stability response format');
+  const b64 = data.artifacts[0].base64;
+  const buffer = Buffer.from(b64, 'base64');
+  fs.writeFileSync(path.join(outDir, filename), buffer);
+}
+
+async function main() {
+  for (let pIndex = 0; pIndex < prompts.length; pIndex++) {
+    const prompt = prompts[pIndex];
+    for (let v = 1; v <= variations; v++) {
+      const filename = \`prompt\${pIndex + 1}_v\${v}.png\`;
+      try {
+        if (provider === 'stability') {
+          if (!apiKey) {
+            console.log('IMAGE_API_KEY not set — skipping generation');
+            return;
+          }
+          console.log(\`Generating (stability) for prompt \${pIndex + 1} variation \${v}\`);
+          await generateStability(prompt, filename);
+          console.log(\`Saved \${filename}\`);
+        } else {
+          console.warn('Unsupported IMAGE_API_PROVIDER; set to "stability" or implement provider adapter.');
+          return;
+        }
+      } catch (err) {
+        console.error('Generation error:', err.message);
+      }
+    }
+  }
+}
+
+main().catch(err => { console.error(err); process.exit(1); });
+`,
+
+  'scripts/youtube-upload.js': `/*
+Uploads videos/<slug>/video.mp4 to YouTube as a draft (or specified visibility).
+Requires local environment vars (do NOT commit):
+- GOOGLE_OAUTH_CLIENT_ID
+- GOOGLE_OAUTH_CLIENT_SECRET
+- GOOGLE_REFRESH_TOKEN
+
+Run locally:
+export GOOGLE_OAUTH_CLIENT_ID="..."
+export GOOGLE_OAUTH_CLIENT_SECRET="..."
+export GOOGLE_REFRESH_TOKEN="..."
+node scripts/youtube-upload.js --slug validate-72h --visibility private
+*/
+const fs = require('fs');
+const path = require('path');
+const { google } = require('googleapis');
+const argv = require('minimist')(process.argv.slice(2));
+
+async function main() {
+  const slug = argv.slug || 'validate-72h';
+  const visibility = argv.visibility || 'private';
+  const metadataPath = path.join('videos', slug, 'metadata.json');
+  const videoPath = path.join('videos', slug, 'video.mp4');
+  const thumbnailsDir = path.join('videos', slug, 'thumbnails');
+
+  if (!fs.existsSync(metadataPath)) throw new Error('metadata.json not found');
+  if (!fs.existsSync(videoPath)) throw new Error('video file not found: ' + videoPath);
+
+  const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error('Missing Google OAuth environment variables');
+  }
+
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+  console.log('Uploading video file:', videoPath);
+  const res = await youtube.videos.insert({
+    part: ['snippet', 'status'],
+    requestBody: {
+      snippet: {
+        title: metadata.title,
+        description: metadata.description,
+        tags: metadata.tags || [],
+        categoryId: metadata.categoryId || '22'
+      },
+      status: {
+        privacyStatus: visibility
+      }
+    },
+    media: {
+      body: fs.createReadStream(videoPath)
+    }
+  }, {
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity
+  });
+
+  const uploaded = res.data;
+  console.log('Upload complete. Video id:', uploaded.id);
+
+  if (fs.existsSync(thumbnailsDir)) {
+    const files = fs.readdirSync(thumbnailsDir).filter(f => /\\.(png|jpe?g)$/i.test(f));
+    if (files.length) {
+      const thumbPath = path.join(thumbnailsDir, files[0]);
+      console.log('Uploading thumbnail:', thumbPath);
+      await youtube.thumbnails.set({
+        videoId: uploaded.id,
+        media: { body: fs.createReadStream(thumbPath) }
+      });
+      console.log('Thumbnail uploaded.');
+    } else console.log('No thumbnail files found to upload.');
+  }
+
+  console.log(\`Video uploaded: https://youtu.be/\${uploaded.id}\`);
+}
+
+main().catch(err => { console.error(err); process.exit(1); });
+`,
+
+  'scripts/claude-gen.js': `/*
+Optional wrapper to call an LLM (example: Anthropic Claude).
+If you don't use CLAUDE_API_KEY this script will exit gracefully.
+
+Use: node scripts/claude-gen.js --prompt "Short title for video"
+*/
+const fs = require('fs');
+const fetch = require('node-fetch');
+const argv = require('minimist')(process.argv.slice(2));
+
+async function main() {
+  const apiKey = process.env.CLAUDE_API_KEY;
+  if (!apiKey) {
+    console.log('CLAUDE_API_KEY not set; skipping Claude generation.');
+    return;
+  }
+
+  const prompt = argv.prompt || 'Generate a short YouTube video title for a startup validation video.';
+  const res = await fetch('https*`
